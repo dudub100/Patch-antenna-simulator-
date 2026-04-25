@@ -9,32 +9,36 @@ MU_0 = 4 * np.pi * 1e-7
 EPS_0 = 8.854187817e-12
 
 def run_fdtd_with_ntff(f_target, L_mm, W_mm, h_mm, er, padding, steps):
-    """3D FDTD Engine with on-the-fly DFT and far-field projection."""
-    # 1. Map Physical Dimensions to Grid (using 1 mm resolution)
-    dx = dy = dz = 1e-3 
+    """3D FDTD Engine with dynamic meshing and 2D planar cut extraction."""
     
-    # Calculate grid sizes based on dimensions + padding for boundary
-    L_cells = int(np.ceil(L_mm))
-    W_cells = int(np.ceil(W_mm))
-    h_cells = int(np.ceil(h_mm))
+    # 1. Dynamic Mesh Resolution (Lambda / 12 rule)
+    lambda_min = C / (f_target * np.sqrt(er))
+    dx = dy = dz = min(1e-3, lambda_min / 12) # Cap at 1mm, shrink for high freq
+    
+    # Convert physical dimensions to cell counts
+    L_cells = int(np.ceil((L_mm * 1e-3) / dx))
+    W_cells = int(np.ceil((W_mm * 1e-3) / dy))
+    h_cells = int(np.ceil((h_mm * 1e-3) / dz))
     
     nx = L_cells + 2 * padding
     ny = W_cells + 2 * padding
-    nz = h_cells + 15 # Padding above the patch
+    nz = h_cells + 15 
     
-    # Calculate Courant limit for stability
     dt = 1.0 / (C * np.sqrt(1/dx**2 + 1/dy**2 + 1/dz**2)) * 0.99
     
+    # Check memory bounds to prevent crashing
+    total_cells = nx * ny * nz
+    if total_cells > 3e6:
+        st.error(f"Grid too large ({total_cells:,} cells). Lower frequency or dimensions.")
+        return None, None, None, None, None
+        
     # 2. Material Setup
     eps = np.ones((nx, ny, nz)) * EPS_0
     mu = np.ones((nx, ny, nz)) * MU_0
-    
-    # Define Substrate
     z_ground = 5
     z_patch = z_ground + h_cells
     eps[:, :, z_ground:z_patch] = EPS_0 * er
     
-    # Update coefficients
     C_e = dt / eps
     C_h = dt / mu
     
@@ -46,52 +50,36 @@ def run_fdtd_with_ntff(f_target, L_mm, W_mm, h_mm, er, padding, steps):
     Hy = np.zeros((nx, ny, nz))
     Hz = np.zeros((nx, ny, nz))
     
-    # DFT Array for target frequency (at the patch surface)
     Ez_phasor = np.zeros((nx, ny), dtype=complex)
     
-    # Define Patch Boundaries
     px_start = padding
     px_end = padding + L_cells
     py_start = padding
     py_end = padding + W_cells
     
-    # Feed point (offset from center to match 50 ohm)
     feed_x = px_start + L_cells // 4
     feed_y = py_start + W_cells // 2
     
     progress_bar = st.progress(0)
-    st.text(f"Grid Size: {nx} x {ny} x {nz} cells")
     
-    # 4. Main Time-Stepping Loop
+    # 4. Main Loop
     for t in range(steps):
-        # Update H (Ampere)
-        Hx[:, :-1, :-1] -= C_h[:, :-1, :-1] / dy * (Ez[:, 1:, :-1] - Ez[:, :-1, :-1]) \
-                         - C_h[:, :-1, :-1] / dz * (Ey[:, :-1, 1:] - Ey[:, :-1, :-1])
-        Hy[:-1, :, :-1] += C_h[:-1, :, :-1] / dx * (Ez[1:, :, :-1] - Ez[:-1, :, :-1]) \
-                         - C_h[:-1, :, :-1] / dz * (Ex[:-1, :, 1:] - Ex[:-1, :, :-1])
-        Hz[:-1, :-1, :] -= C_h[:-1, :-1, :] / dx * (Ey[1:, :-1, :] - Ey[:-1, :-1, :]) \
-                         - C_h[:-1, :-1, :] / dy * (Ex[:-1, 1:, :] - Ex[:-1, :-1, :])
+        Hx[:, :-1, :-1] -= C_h[:, :-1, :-1] / dy * (Ez[:, 1:, :-1] - Ez[:, :-1, :-1]) - C_h[:, :-1, :-1] / dz * (Ey[:, :-1, 1:] - Ey[:, :-1, :-1])
+        Hy[:-1, :, :-1] += C_h[:-1, :, :-1] / dx * (Ez[1:, :, :-1] - Ez[:-1, :, :-1]) - C_h[:-1, :, :-1] / dz * (Ex[:-1, :, 1:] - Ex[:-1, :, :-1])
+        Hz[:-1, :-1, :] -= C_h[:-1, :-1, :] / dx * (Ey[1:, :-1, :] - Ey[:-1, :-1, :]) - C_h[:-1, :-1, :] / dy * (Ex[:-1, 1:, :] - Ex[:-1, :-1, :])
 
-        # Update E (Faraday)
-        Ex[:, 1:, 1:] += C_e[:, 1:, 1:] / dy * (Hz[:, 1:, 1:] - Hz[:, :-1, 1:]) \
-                       - C_e[:, 1:, 1:] / dz * (Hy[:, 1:, 1:] - Hy[:, 1:, :-1])
-        Ey[1:, :, 1:] -= C_e[1:, :, 1:] / dx * (Hz[1:, :, 1:] - Hz[:-1, :, 1:]) \
-                       - C_e[1:, :, 1:] / dz * (Hx[1:, :, 1:] - Hx[1:, :, :-1])
-        Ez[1:, 1:, :] += C_e[1:, 1:, :] / dx * (Hy[1:, 1:, :] - Hy[:-1, 1:, :]) \
-                       - C_e[1:, 1:, :] / dy * (Hx[1:, 1:, :] - Hx[:-1, 1:, :])
+        Ex[:, 1:, 1:] += C_e[:, 1:, 1:] / dy * (Hz[:, 1:, 1:] - Hz[:, :-1, 1:]) - C_e[:, 1:, 1:] / dz * (Hy[:, 1:, 1:] - Hy[:, 1:, :-1])
+        Ey[1:, :, 1:] -= C_e[1:, :, 1:] / dx * (Hz[1:, :, 1:] - Hz[:-1, :, 1:]) - C_e[1:, :, 1:] / dz * (Hx[1:, :, 1:] - Hx[1:, :, :-1])
+        Ez[1:, 1:, :] += C_e[1:, 1:, :] / dx * (Hy[1:, 1:, :] - Hy[:-1, 1:, :]) - C_e[1:, 1:, :] / dy * (Hx[1:, 1:, :] - Hx[:-1, 1:, :])
 
-        # Gaussian Pulse Excitation at feed point
         pulse = np.exp(-0.5 * ((t - 40) / 15.0)**2)
         Ez[feed_x, feed_y, z_ground:z_patch] += pulse
 
-        # Boundary Conditions (PEC for ground and patch)
         Ex[:, :, z_ground] = 0
         Ey[:, :, z_ground] = 0
         Ex[px_start:px_end, py_start:py_end, z_patch] = 0
         Ey[px_start:px_end, py_start:py_end, z_patch] = 0
         
-        # 5. Running DFT at Target Frequency
-        # We record the complex fields at the patch plane to project to far-field
         omega = 2 * np.pi * f_target
         Ez_phasor += Ez[:, :, z_patch] * np.exp(-1j * omega * t * dt)
 
@@ -100,78 +88,90 @@ def run_fdtd_with_ntff(f_target, L_mm, W_mm, h_mm, er, padding, steps):
             
     progress_bar.empty()
     
-    # 6. Near-to-Far-Field Transformation (using Aperture 2D FFT)
-    # The 2D Spatial Fourier Transform of the aperture fields yields the far-field pattern
+    # 5. Near-to-Far-Field
     E_far = np.fft.fftshift(np.fft.fft2(Ez_phasor))
     Pattern = np.abs(E_far)
     Pattern_dB = 20 * np.log10(Pattern / np.max(Pattern) + 1e-10)
-    Pattern_dB[Pattern_dB < -40] = -40 # Clip at -40dB for clean plotting
+    Pattern_dB[Pattern_dB < -40] = -40 
     
-    return Ez_phasor, Pattern_dB, nx, ny
+    return Ez_phasor, Pattern_dB, nx, ny, dx
 
 # --- Streamlit UI ---
 st.set_page_config(layout="wide")
-st.title("⚡ Exact 3D FDTD: Patch Antenna Solver")
-st.markdown("Includes physical dimensions, dynamic grid mapping, on-the-fly DFT, and Far-Field extraction.")
+st.title("⚡ FDTD Patch Solver: mmWave to 100 GHz")
 
 with st.sidebar:
     st.header("1. Target Frequency")
-    f_ghz = st.slider("Frequency (GHz)", 1.0, 10.0, 2.4)
+    f_ghz = st.slider("Frequency (GHz)", 1.0, 100.0, 28.0, step=0.5)
     f_target = f_ghz * 1e9
     
     st.header("2. Physical Dimensions")
-    L_mm = st.number_input("Patch Length (mm)", 10.0, 100.0, 29.0)
-    W_mm = st.number_input("Patch Width (mm)", 10.0, 100.0, 38.0)
-    h_mm = st.number_input("Substrate Height (mm)", 1.0, 10.0, 1.5)
+    # Defaults set smaller for mmWave frequencies
+    L_mm = st.number_input("Patch Length (mm)", 0.1, 100.0, 4.0)
+    W_mm = st.number_input("Patch Width (mm)", 0.1, 100.0, 5.0)
+    h_mm = st.number_input("Substrate Height (mm)", 0.1, 10.0, 0.5)
+    er = st.number_input("Relative Permittivity (εr)", 1.0, 10.0, 2.2)
     
-    st.header("3. Material Properties")
-    er = st.number_input("Relative Permittivity (εr)", 1.0, 10.0, 4.4)
+    st.header("3. FDTD Settings")
+    steps = st.slider("Time Steps", 100, 2000, 400)
+    padding = st.slider("Grid Padding (cells)", 10, 50, 20)
     
-    st.header("4. FDTD Settings")
-    steps = st.slider("Time Steps", 100, 1000, 300)
-    padding = st.slider("Grid Padding (cells)", 10, 30, 15)
-    
-    run_sim = st.button("Solve Maxwell's Equations", type="primary")
+    run_sim = st.button("Solve FDTD Mesh", type="primary")
 
 if run_sim:
     start = time.time()
-    with st.spinner("Running Time-Domain Simulation & Calculating DFT..."):
-        Ez_phasor, Pattern_dB, nx, ny = run_fdtd_with_ntff(f_target, L_mm, W_mm, h_mm, er, padding, steps)
+    with st.spinner("Calculating Sub-Millimeter Mesh & Running FDTD..."):
+        Ez_phasor, Pattern_dB, nx, ny, dx = run_fdtd_with_ntff(f_target, L_mm, W_mm, h_mm, er, padding, steps)
     
-    st.success(f"Simulation solved in {time.time() - start:.2f} seconds!")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Near-Field (Target Frequency Phasor)")
-        st.markdown("Amplitude of the $E_z$ field exactly at the resonant frequency.")
-        fig1 = go.Figure(data=go.Heatmap(
-            z=np.abs(Ez_phasor), 
-            colorscale='Viridis',
-            colorbar=dict(title="|Ez|")
-        ))
-        fig1.update_layout(xaxis_title="X (mm)", yaxis_title="Y (mm)", height=500)
-        st.plotly_chart(fig1)
+    if Ez_phasor is not None:
+        st.success(f"Simulation solved in {time.time() - start:.2f} seconds! Grid Resolution: {dx*1000:.3f} mm")
         
-    with col2:
-        st.subheader("Far-Field Radiation Pattern (Aperture Projection)")
-        st.markdown("Calculated via 2D Spatial FFT (Huygens' Principle).")
+        # --- 2D Planar Cuts (Vertical and Horizontal) ---
+        st.subheader("2D Radiation Pattern Cuts")
         
-        # Create k-space grid for 3D plotting
-        u = np.linspace(-1, 1, nx)
-        v = np.linspace(-1, 1, ny)
-        U, V = np.meshgrid(v, u)
+        # In spatial frequency u,v coords:
+        # Center row = Vertical axis (Phi=0, E-plane for standard excitation)
+        # Center column = Horizontal axis (Phi=90, H-plane)
+        mid_x = nx // 2
+        mid_y = ny // 2
         
-        # Mask out non-radiating region (visible space u^2 + v^2 <= 1)
+        theta_axis = np.arcsin(np.linspace(-1, 1, nx)) * (180/np.pi)
+        theta_axis_y = np.arcsin(np.linspace(-1, 1, ny)) * (180/np.pi)
+        
+        # Mask out imaginary angles outside the visible hemisphere
+        mask_x = ~np.isnan(theta_axis)
+        mask_y = ~np.isnan(theta_axis_y)
+        
+        e_plane = Pattern_dB[mid_x, :]  # Slice across Y
+        h_plane = Pattern_dB[:, mid_y]  # Slice across X
+        
+        fig2d = go.Figure()
+        fig2d.add_trace(go.Scatter(x=theta_axis_y[mask_y], y=e_plane[mask_y], mode='lines', name="Vertical Cut (E-Plane / Φ=0°)"))
+        fig2d.add_trace(go.Scatter(x=theta_axis[mask_x], y=h_plane[mask_x], mode='lines', name="Horizontal Cut (H-Plane / Φ=90°)"))
+        
+        fig2d.update_layout(
+            xaxis_title="Theta (Degrees)", 
+            yaxis_title="Normalized Gain (dB)", 
+            height=400,
+            hovermode="x unified",
+            legend=dict(yanchor="bottom", y=0.01, xanchor="left", x=0.01)
+        )
+        st.plotly_chart(fig2d, use_container_width=True)
+
+        # --- 3D Pattern ---
+        st.subheader("3D Radiation Pattern")
+        u = np.linspace(-1, 1, ny)
+        v = np.linspace(-1, 1, nx)
+        U, V = np.meshgrid(u, v)
+        
         visible_space = U**2 + V**2 <= 1
         Pattern_dB_masked = np.where(visible_space, Pattern_dB, -40)
         
-        # Convert u,v to spherical for 3D plot
-        R = Pattern_dB_masked - np.min(Pattern_dB_masked) # Linearize shape
+        R = Pattern_dB_masked - np.min(Pattern_dB_masked)
         Z = R * np.sqrt(np.clip(1 - U**2 - V**2, 0, 1))
         X = R * U
         Y = R * V
         
-        fig2 = go.Figure(data=[go.Surface(x=X, y=Y, z=Z, surfacecolor=Pattern_dB_masked, colorscale='Jet')])
-        fig2.update_layout(scene=dict(xaxis_title='U', yaxis_title='V', zaxis_title='Gain (dB)'), height=500, margin=dict(l=0, r=0, b=0, t=0))
-        st.plotly_chart(fig2)
+        fig3d = go.Figure(data=[go.Surface(x=X, y=Y, z=Z, surfacecolor=Pattern_dB_masked, colorscale='Jet')])
+        fig3d.update_layout(scene=dict(xaxis_title='U', yaxis_title='V', zaxis_title='Gain (dB)'), height=500)
+        st.plotly_chart(fig3d, use_container_width=True)
