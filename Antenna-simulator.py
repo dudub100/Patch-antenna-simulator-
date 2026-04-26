@@ -3,19 +3,69 @@ import numpy as np
 import plotly.graph_objects as go
 import time
 
-# Physical Constants
+# --- Physical Constants ---
 C = 299792458.0
 MU_0 = 4 * np.pi * 1e-7
 EPS_0 = 8.854187817e-12
 
-def run_fdtd_with_ntff(f_target, L_mm, W_mm, h_mm, er, padding, steps):
-    """3D FDTD Engine with dynamic meshing and 2D planar cut extraction."""
+def calculate_cavity_model(freq, L, W, h, er, nx, ny):
+    """Analytical Cavity Model for comparison."""
+    k0 = 2 * np.pi * freq / C
     
-    # 1. Dynamic Mesh Resolution (Lambda / 12 rule)
+    # Effective parameters (Hammerstad & Jensen)
+    eeff = (er + 1) / 2 + (er - 1) / 2 * (1 + 12 * h / W)**-0.5
+    delta_L = 0.412 * h * ((eeff + 0.3) * (W / h + 0.264)) / ((eeff - 0.258) * (W / h + 0.8))
+    L_eff = L + 2 * delta_L
+    
+    # Create the same coordinate grid as FDTD FFT (u, v space)
+    u = np.linspace(-1, 1, nx)
+    v = np.linspace(-1, 1, ny)
+    U, V = np.meshgrid(v, u) # V maps to X, U maps to Y in our FDTD setup
+    
+    # Mask visible space
+    visible = U**2 + V**2 <= 1
+    THETA = np.arcsin(np.sqrt(np.clip(U**2 + V**2, 0, 1)))
+    PHI = np.arctan2(V, U + 1e-10)
+    
+    # Cavity Model Equations
+    X = k0 * h / 2 * np.sin(THETA) * np.cos(PHI) + 1e-10
+    f_theta = (np.sin(X) / X) * np.cos(k0 * L_eff / 2 * np.sin(THETA) * np.cos(PHI)) * np.cos(PHI)
+    f_phi = (np.sin(X) / X) * np.cos(k0 * L_eff / 2 * np.sin(THETA) * np.cos(PHI)) * np.cos(THETA) * np.sin(PHI)
+    
+    E_total = np.sqrt(np.abs(f_theta)**2 + np.abs(f_phi)**2)
+    E_total = np.where(visible, E_total, 0)
+    
+    return E_total, U, V
+
+def calculate_directivity_dBi(Pattern_Linear, U, V):
+    """Integrates the linear pattern (E-field) over the hemisphere to find absolute Gain (Directivity)."""
+    # Radiation intensity U_rad is proportional to |E|^2
+    U_rad = np.abs(Pattern_Linear)**2
+    
+    # Area element in u,v space: du * dv / cos(theta)
+    du = U[0,1] - U[0,0]
+    dv = V[1,0] - V[0,0]
+    
+    cos_theta = np.sqrt(np.clip(1 - U**2 - V**2, 1e-5, 1))
+    visible = U**2 + V**2 <= 1
+    
+    # Total radiated power (integrating over the visible hemisphere in u,v coordinates)
+    P_rad = np.sum(U_rad[visible] / cos_theta[visible]) * du * dv
+    
+    # Maximum intensity
+    U_max = np.max(U_rad)
+    
+    # Directivity = 4 * pi * U_max / (Total Power) 
+    # Since we only integrate over a hemisphere, we multiply by 2*pi for the hemisphere power equivalent
+    D = (2 * np.pi * U_max) / P_rad
+    
+    return 10 * np.log10(D)
+
+def run_fdtd(f_target, L_mm, W_mm, h_mm, er, padding, steps):
+    """Core FDTD engine returning actual linear far-field pattern."""
     lambda_min = C / (f_target * np.sqrt(er))
-    dx = dy = dz = min(1e-3, lambda_min / 12) # Cap at 1mm, shrink for high freq
+    dx = dy = dz = min(1e-3, lambda_min / 12) 
     
-    # Convert physical dimensions to cell counts
     L_cells = int(np.ceil((L_mm * 1e-3) / dx))
     W_cells = int(np.ceil((W_mm * 1e-3) / dy))
     h_cells = int(np.ceil((h_mm * 1e-3) / dz))
@@ -24,15 +74,12 @@ def run_fdtd_with_ntff(f_target, L_mm, W_mm, h_mm, er, padding, steps):
     ny = W_cells + 2 * padding
     nz = h_cells + 15 
     
-    dt = 1.0 / (C * np.sqrt(1/dx**2 + 1/dy**2 + 1/dz**2)) * 0.99
-    
-    # Check memory bounds to prevent crashing
-    total_cells = nx * ny * nz
-    if total_cells > 3e6:
-        st.error(f"Grid too large ({total_cells:,} cells). Lower frequency or dimensions.")
+    if nx * ny * nz > 3e6:
+        st.error("Grid too large. Reduce dimensions or frequency.")
         return None, None, None, None, None
         
-    # 2. Material Setup
+    dt = 1.0 / (C * np.sqrt(1/dx**2 + 1/dy**2 + 1/dz**2)) * 0.99
+    
     eps = np.ones((nx, ny, nz)) * EPS_0
     mu = np.ones((nx, ny, nz)) * MU_0
     z_ground = 5
@@ -42,27 +89,16 @@ def run_fdtd_with_ntff(f_target, L_mm, W_mm, h_mm, er, padding, steps):
     C_e = dt / eps
     C_h = dt / mu
     
-    # 3. Field Initialization
-    Ex = np.zeros((nx, ny, nz))
-    Ey = np.zeros((nx, ny, nz))
-    Ez = np.zeros((nx, ny, nz))
-    Hx = np.zeros((nx, ny, nz))
-    Hy = np.zeros((nx, ny, nz))
-    Hz = np.zeros((nx, ny, nz))
-    
+    Ex, Ey, Ez = np.zeros((nx, ny, nz)), np.zeros((nx, ny, nz)), np.zeros((nx, ny, nz))
+    Hx, Hy, Hz = np.zeros((nx, ny, nz)), np.zeros((nx, ny, nz)), np.zeros((nx, ny, nz))
     Ez_phasor = np.zeros((nx, ny), dtype=complex)
     
-    px_start = padding
-    px_end = padding + L_cells
-    py_start = padding
-    py_end = padding + W_cells
-    
-    feed_x = px_start + L_cells // 4
-    feed_y = py_start + W_cells // 2
+    px_start, px_end = padding, padding + L_cells
+    py_start, py_end = padding, padding + W_cells
+    feed_x, feed_y = px_start + L_cells // 4, py_start + W_cells // 2
     
     progress_bar = st.progress(0)
     
-    # 4. Main Loop
     for t in range(steps):
         Hx[:, :-1, :-1] -= C_h[:, :-1, :-1] / dy * (Ez[:, 1:, :-1] - Ez[:, :-1, :-1]) - C_h[:, :-1, :-1] / dz * (Ey[:, :-1, 1:] - Ey[:, :-1, :-1])
         Hy[:-1, :, :-1] += C_h[:-1, :, :-1] / dx * (Ez[1:, :, :-1] - Ez[:-1, :, :-1]) - C_h[:-1, :, :-1] / dz * (Ex[:-1, :, 1:] - Ex[:-1, :, :-1])
@@ -75,10 +111,8 @@ def run_fdtd_with_ntff(f_target, L_mm, W_mm, h_mm, er, padding, steps):
         pulse = np.exp(-0.5 * ((t - 40) / 15.0)**2)
         Ez[feed_x, feed_y, z_ground:z_patch] += pulse
 
-        Ex[:, :, z_ground] = 0
-        Ey[:, :, z_ground] = 0
-        Ex[px_start:px_end, py_start:py_end, z_patch] = 0
-        Ey[px_start:px_end, py_start:py_end, z_patch] = 0
+        Ex[:, :, z_ground], Ey[:, :, z_ground] = 0, 0
+        Ex[px_start:px_end, py_start:py_end, z_patch], Ey[px_start:px_end, py_start:py_end, z_patch] = 0, 0
         
         omega = 2 * np.pi * f_target
         Ez_phasor += Ez[:, :, z_patch] * np.exp(-1j * omega * t * dt)
@@ -87,91 +121,72 @@ def run_fdtd_with_ntff(f_target, L_mm, W_mm, h_mm, er, padding, steps):
             progress_bar.progress((t + 1) / steps)
             
     progress_bar.empty()
-    
-    # 5. Near-to-Far-Field
-    E_far = np.fft.fftshift(np.fft.fft2(Ez_phasor))
-    Pattern = np.abs(E_far)
-    Pattern_dB = 20 * np.log10(Pattern / np.max(Pattern) + 1e-10)
-    Pattern_dB[Pattern_dB < -40] = -40 
-    
-    return Ez_phasor, Pattern_dB, nx, ny, dx
+    E_far_linear = np.abs(np.fft.fftshift(np.fft.fft2(Ez_phasor)))
+    return E_far_linear, nx, ny
 
 # --- Streamlit UI ---
 st.set_page_config(layout="wide")
-st.title("⚡ FDTD Patch Solver: mmWave to 100 GHz")
+st.title("⚡ Antenna Gain: FDTD vs. Cavity Model")
 
 with st.sidebar:
-    st.header("1. Target Frequency")
-    f_ghz = st.slider("Frequency (GHz)", 1.0, 100.0, 28.0, step=0.5)
-    f_target = f_ghz * 1e9
+    st.header("Antenna Parameters")
+    f_ghz = st.slider("Frequency (GHz)", 1.0, 30.0, 2.4, step=0.1)
+    L_mm = st.number_input("Patch Length (mm)", 1.0, 100.0, 29.0)
+    W_mm = st.number_input("Patch Width (mm)", 1.0, 100.0, 38.0)
+    h_mm = st.number_input("Substrate Height (mm)", 0.1, 10.0, 1.5)
+    er = st.number_input("Relative Permittivity (εr)", 1.0, 10.0, 4.4)
     
-    st.header("2. Physical Dimensions")
-    # Defaults set smaller for mmWave frequencies
-    L_mm = st.number_input("Patch Length (mm)", 0.1, 100.0, 4.0)
-    W_mm = st.number_input("Patch Width (mm)", 0.1, 100.0, 5.0)
-    h_mm = st.number_input("Substrate Height (mm)", 0.1, 10.0, 0.5)
-    er = st.number_input("Relative Permittivity (εr)", 1.0, 10.0, 2.2)
-    
-    st.header("3. FDTD Settings")
-    steps = st.slider("Time Steps", 100, 2000, 400)
-    padding = st.slider("Grid Padding (cells)", 10, 50, 20)
-    
-    run_sim = st.button("Solve FDTD Mesh", type="primary")
+    st.header("FDTD Setup")
+    steps = st.slider("Time Steps", 100, 1000, 300)
+    padding = st.slider("Grid Padding", 10, 50, 20)
+    run_sim = st.button("Run Comparison", type="primary")
 
 if run_sim:
-    start = time.time()
-    with st.spinner("Calculating Sub-Millimeter Mesh & Running FDTD..."):
-        Ez_phasor, Pattern_dB, nx, ny, dx = run_fdtd_with_ntff(f_target, L_mm, W_mm, h_mm, er, padding, steps)
+    f_target = f_ghz * 1e9
     
-    if Ez_phasor is not None:
-        st.success(f"Simulation solved in {time.time() - start:.2f} seconds! Grid Resolution: {dx*1000:.3f} mm")
+    with st.spinner("Running FDTD and Analytical Models..."):
+        fdtd_linear, nx, ny = run_fdtd(f_target, L_mm, W_mm, h_mm, er, padding, steps)
         
-        # --- 2D Planar Cuts (Vertical and Horizontal) ---
-        st.subheader("2D Radiation Pattern Cuts")
+    if fdtd_linear is not None:
+        # Calculate Cavity Model
+        cavity_linear, U, V = calculate_cavity_model(f_target, L_mm*1e-3, W_mm*1e-3, h_mm*1e-3, er, nx, ny)
         
-        # In spatial frequency u,v coords:
-        # Center row = Vertical axis (Phi=0, E-plane for standard excitation)
-        # Center column = Horizontal axis (Phi=90, H-plane)
-        mid_x = nx // 2
-        mid_y = ny // 2
+        # Calculate Absolute Gain (dBi) for both
+        gain_fdtd = calculate_directivity_dBi(fdtd_linear, U, V)
+        gain_cavity = calculate_directivity_dBi(cavity_linear, U, V)
         
+        st.success("Simulation Complete!")
+        
+        # --- Metrics Display ---
+        col1, col2, col3 = st.columns(3)
+        col1.metric("FDTD Computed Gain", f"{gain_fdtd:.2f} dBi")
+        col2.metric("Cavity Model Gain", f"{gain_cavity:.2f} dBi")
+        col3.metric("Difference", f"{abs(gain_fdtd - gain_cavity):.2f} dB")
+        
+        # Normalize patterns to their respective actual gains for plotting
+        FDTD_dB = 20 * np.log10(fdtd_linear / np.max(fdtd_linear) + 1e-10) + gain_fdtd
+        Cavity_dB = 20 * np.log10(cavity_linear / np.max(cavity_linear) + 1e-10) + gain_cavity
+        
+        FDTD_dB[FDTD_dB < -40] = -40
+        Cavity_dB[Cavity_dB < -40] = -40
+        
+        # --- 2D Comparisons ---
+        st.subheader("2D Planar Cuts: FDTD vs Cavity Model")
+        mid_x, mid_y = nx // 2, ny // 2
         theta_axis = np.arcsin(np.linspace(-1, 1, nx)) * (180/np.pi)
-        theta_axis_y = np.arcsin(np.linspace(-1, 1, ny)) * (180/np.pi)
+        mask = ~np.isnan(theta_axis)
         
-        # Mask out imaginary angles outside the visible hemisphere
-        mask_x = ~np.isnan(theta_axis)
-        mask_y = ~np.isnan(theta_axis_y)
+        fig2d_V = go.Figure()
+        fig2d_V.add_trace(go.Scatter(x=theta_axis[mask], y=FDTD_dB[mid_x, mask], name="FDTD (Vertical / E-Plane)", line=dict(color='blue')))
+        fig2d_V.add_trace(go.Scatter(x=theta_axis[mask], y=Cavity_dB[mid_x, mask], name="Cavity (Vertical / E-Plane)", line=dict(color='blue', dash='dash')))
         
-        e_plane = Pattern_dB[mid_x, :]  # Slice across Y
-        h_plane = Pattern_dB[:, mid_y]  # Slice across X
+        fig2d_H = go.Figure()
+        fig2d_H.add_trace(go.Scatter(x=theta_axis[mask], y=FDTD_dB[mask, mid_y], name="FDTD (Horizontal / H-Plane)", line=dict(color='red')))
+        fig2d_H.add_trace(go.Scatter(x=theta_axis[mask], y=Cavity_dB[mask, mid_y], name="Cavity (Horizontal / H-Plane)", line=dict(color='red', dash='dash')))
         
-        fig2d = go.Figure()
-        fig2d.add_trace(go.Scatter(x=theta_axis_y[mask_y], y=e_plane[mask_y], mode='lines', name="Vertical Cut (E-Plane / Φ=0°)"))
-        fig2d.add_trace(go.Scatter(x=theta_axis[mask_x], y=h_plane[mask_x], mode='lines', name="Horizontal Cut (H-Plane / Φ=90°)"))
+        fig2d_V.update_layout(title="Vertical Cut (E-Plane)", xaxis_title="Theta (Degrees)", yaxis_title="Actual Gain (dBi)", height=400)
+        fig2d_H.update_layout(title="Horizontal Cut (H-Plane)", xaxis_title="Theta (Degrees)", yaxis_title="Actual Gain (dBi)", height=400)
         
-        fig2d.update_layout(
-            xaxis_title="Theta (Degrees)", 
-            yaxis_title="Normalized Gain (dB)", 
-            height=400,
-            hovermode="x unified",
-            legend=dict(yanchor="bottom", y=0.01, xanchor="left", x=0.01)
-        )
-        st.plotly_chart(fig2d, use_container_width=True)
-
-        # --- 3D Pattern ---
-        st.subheader("3D Radiation Pattern")
-        u = np.linspace(-1, 1, ny)
-        v = np.linspace(-1, 1, nx)
-        U, V = np.meshgrid(u, v)
-        
-        visible_space = U**2 + V**2 <= 1
-        Pattern_dB_masked = np.where(visible_space, Pattern_dB, -40)
-        
-        R = Pattern_dB_masked - np.min(Pattern_dB_masked)
-        Z = R * np.sqrt(np.clip(1 - U**2 - V**2, 0, 1))
-        X = R * U
-        Y = R * V
-        
-        fig3d = go.Figure(data=[go.Surface(x=X, y=Y, z=Z, surfacecolor=Pattern_dB_masked, colorscale='Jet')])
-        fig3d.update_layout(scene=dict(xaxis_title='U', yaxis_title='V', zaxis_title='Gain (dB)'), height=500)
-        st.plotly_chart(fig3d, use_container_width=True)
+        c1, c2 = st.columns(2)
+        c1.plotly_chart(fig2d_V, use_container_width=True)
+        c2.plotly_chart(fig2d_H, use_container_width=True)
